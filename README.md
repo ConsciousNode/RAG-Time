@@ -51,7 +51,7 @@ RAG Time speaks a postMessage API for embedding into any ConsciousNode platform:
 **Kehai Interim** — SheafMemory v2: Fisher-Rao geodesic, Poincaré ball lifecycle, H¹(ℱ) coboundary detection, PoST decay gates (from Evangelion Phase 6)  
 **Vael Interim** — RAG Time: RWKV-v7 embedder, OOMB chunk-recurrent memory manager, LittleBit-2 XNOR/POPCNT vector index, RAG query pipeline, contrastive adaptation, centrality-weighted ingestion, embedder writeback, UI, integration spec
 
-A ConsciousNode SoftWorks / Tama Hagane Seam Labs joint.
+A ConsciousNode SoftWorks project.
 
 ---
 
