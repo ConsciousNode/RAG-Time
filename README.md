@@ -29,6 +29,18 @@ It is not assembled from libraries. It is built from principles.
 
 ---
 
+## Changelog
+
+### v4.0 — 2026-06-07 · Vael Interim (self-directed)
+
+Three interconnected capabilities built as a single cohesive addition:
+
+- **Corpus-driven embedding adaptation** — contrastive self-supervised learning signal derived entirely from ingested structure. Same-document chunk pairs are pulled together in embedding space; high-H¹(ℱ) contradiction pairs are pushed apart. No external labels required. *The sheaf supervises the embedder.* Runs as a background task after ingestion crosses threshold. The memory topology trains the thing that builds the memory topology.
+
+- **Centrality-weighted ingestion depth** — high-centrality chunks (low Poincaré radius, frequently retrieved — the core memories) receive more RWKV recurrent steps on re-ingestion. Poincaré lifecycle now wired into OOMB depth scheduling. Memories that matter accumulate more representational capacity over time.
+
+- **Embedder writeback (`rt:exportEmbedder`)** — RAG Time can now export its adapted embedder state back to a connected Evangelion instance. Contradiction resolutions and contrastive adaptations flow upstream. The data geometry is now bidirectional: Evangelion trains the embedder, RAG Time adapts it, the adaptation returns to Evangelion. New ADAPT tab in UI with contrastive training controls, writeback status, and adaptation history sparkline.
+
 ## Integration
 
 RAG Time speaks a postMessage API for embedding into any ConsciousNode platform:

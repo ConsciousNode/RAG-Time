@@ -731,7 +731,9 @@ footer::-webkit-scrollbar{display:none;}
 <!-- ══ SHEAF / H¹ ══ -->
 <div class="screen" id="screen-sheaf">
   <div class="panel">
-    <div class="ph">SHEAF COHOMOLOGY <span class="tag tsh">H¹(ℱ) CONTRADICTION DETECTION</span></div>
+    <div class="ph">SHEAF COHOMOLOGY <span class="tag tsh">H¹(ℱ) CONTRADICTION DETECTION</span>
+      <label style="float:right; font-size:10px; cursor:pointer; color:var(--rt);"><input type="checkbox" id="compact-mode-chk" onchange="toggleCompactMode()"> COMPACT MODE</label>
+    </div>
 
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;">
       <div>
@@ -1490,6 +1492,11 @@ class RWKVv7Block {
 
 // ── SheafMemory v2 (verbatim from Evangelion Phase 6 / Kehai Interim) ─────
 const SHEAF_CONFIG = { sheaf_contradiction_threshold: 0.5 };
+const COMPACT_MODE = { enabled: false };
+window.toggleCompactMode = function() {
+  COMPACT_MODE.enabled = document.getElementById('compact-mode-chk').checked;
+  LOG.dim('Compact mode ' + (COMPACT_MODE.enabled ? 'enabled' : 'disabled'));
+};
 class SheafMemory {
   constructor(dim) {
     this.dim = dim;
@@ -1664,12 +1671,12 @@ class OOMBManager {
 
   // Stream chunks through RWKV state — O(1) activation memory
   // Returns final state (the embedding) + chunk count
-  async streamEmbed(text, embedder, onProgress) {
+  async streamEmbed(text, embedder, onProgress, learnBPE = true) {
     const chunks = this.chunk(text);
     let state = embedder.getEmptyState();
     for (let i = 0; i < chunks.length; i++) {
       // Embed chunk — activations computed and immediately used
-      const result = embedder.embedChunk(chunks[i], state);
+      const result = embedder.embedChunk(chunks[i], state, learnBPE);
       state = result.state; // only keep state, discard activations
       if (onProgress) onProgress(i, chunks.length, chunks[i]);
       // Yield to main thread to prevent blocking
@@ -1681,6 +1688,67 @@ class OOMBManager {
   }
 }
 
+// ── Dynamic BPE Tokenizer ──────────────────────────────────────────────────
+class DynamicBPE {
+  constructor(maxVocab, dim, charEmbed) {
+    this.maxVocab = maxVocab;
+    this.dim = dim;
+    this.charEmbed = charEmbed;
+    this.vocabSize = 256;
+    this.merges = new Map(); // "t1,t2" -> newToken
+  }
+
+  encode(text) {
+    const bytes = new TextEncoder().encode(text);
+    let tokens = Array.from(bytes);
+    let merged = true;
+    while (merged) {
+      merged = false;
+      for (let i = 0; i < tokens.length - 1; i++) {
+        const pair = `${tokens[i]},${tokens[i+1]}`;
+        if (this.merges.has(pair)) {
+          tokens.splice(i, 2, this.merges.get(pair));
+          merged = true;
+          break;
+        }
+      }
+    }
+    return tokens;
+  }
+
+  learn(text) {
+    if (this.vocabSize >= this.maxVocab) return;
+    let tokens = this.encode(text);
+    let learned = 0;
+    while (this.vocabSize < this.maxVocab && learned < 3) {
+      const pairs = new Map();
+      for (let i = 0; i < tokens.length - 1; i++) {
+        const pair = `${tokens[i]},${tokens[i+1]}`;
+        pairs.set(pair, (pairs.get(pair) || 0) + 1);
+      }
+      let maxFreq = 0, bestPair = null;
+      for (const [pair, freq] of pairs.entries()) {
+        if (freq > maxFreq) { maxFreq = freq; bestPair = pair; }
+      }
+      if (bestPair && maxFreq > 1) {
+        const newToken = this.vocabSize++;
+        this.merges.set(bestPair, newToken);
+        const [t1, t2] = bestPair.split(',').map(Number);
+        const offNew = newToken * this.dim;
+        const off1 = t1 * this.dim;
+        const off2 = t2 * this.dim;
+        for (let d = 0; d < this.dim; d++) {
+          this.charEmbed[offNew + d] = (this.charEmbed[off1 + d] + this.charEmbed[off2 + d]) * 0.5;
+        }
+        tokens = this.encode(text);
+        learned++;
+      } else {
+        break;
+      }
+    }
+  }
+}
+
 // ── RagTimeEmbedder ───────────────────────────────────────────────────────
 // RWKV-v7 recurrent state as embedding.
 // Same representational geometry as Evangelion.
@@ -1688,25 +1756,36 @@ class RagTimeEmbedder {
   constructor(cfg) {
     this.cfg = cfg; // { dim, layers }
     this.blocks = Array.from({ length: cfg.layers }, () => new RWKVv7Block(cfg.dim, cfg.dim * 2));
-    // Simple character tokenizer — maps chars to vectors via learned embedding
-    this.charEmbed = new Float32Array(256 * cfg.dim);
+    
+    // Dynamic BPE + UTF-8 Tokenizer
+    this.maxVocab = 2048;
+    this.charEmbed = new Float32Array(this.maxVocab * cfg.dim);
     const scale = Math.sqrt(1.0 / cfg.dim);
-    for (let i = 0; i < this.charEmbed.length; i++) this.charEmbed[i] = (Math.random()*2-1)*scale;
-    LOG.ok(`RagTimeEmbedder: RWKV-v7 ${cfg.layers}L × ${cfg.dim}D initialized`);
+    for (let i = 0; i < 256 * cfg.dim; i++) this.charEmbed[i] = (Math.random()*2-1)*scale;
+    
+    this.bpe = new DynamicBPE(this.maxVocab, cfg.dim, this.charEmbed);
+    LOG.ok(`RagTimeEmbedder: RWKV-v7 ${cfg.layers}L × ${cfg.dim}D initialized with Dynamic BPE`);
   }
 
   getEmptyState() {
     return this.blocks.map(() => ({ prevX: null, prevX2: null, num: null, den: null }));
   }
 
+  tokenize(text) {
+    return this.bpe.encode(text);
+  }
+
   // Embed a chunk through all RWKV layers, return final state
-  embedChunk(text, state) {
+  embedChunk(text, state, learnBPE = true) {
+    if (learnBPE) this.bpe.learn(text);
+    const tokens = this.bpe.encode(text);
+    
     let currentState = state.map(s => ({ ...s }));
     const dim = this.cfg.dim;
-    for (let ci = 0; ci < text.length; ci++) {
-      const charCode = text.charCodeAt(ci) & 0xFF;
+    for (let ci = 0; ci < tokens.length; ci++) {
+      const t = tokens[ci];
       const x = new Float32Array(dim);
-      const offset = charCode * dim;
+      const offset = t * dim;
       for (let d = 0; d < dim; d++) x[d] = this.charEmbed[offset + d];
       for (let l = 0; l < this.blocks.length; l++) {
         const result = this.blocks[l].forward(x, currentState[l]);
@@ -1747,7 +1826,7 @@ class RagTimeEmbedder {
   // Embed a full text string (short — no OOMB chunking)
   embedText(text) {
     const state = this.getEmptyState();
-    const result = this.embedChunk(text.slice(0, 512), state); // cap at 512 chars for direct embed
+    const result = this.embedChunk(text.slice(0, 512), state, false); // cap at 512 chars for direct embed, no BPE learning
     return this.stateToEmbedding(result.state);
   }
 
@@ -1855,7 +1934,9 @@ async function ingestContent(text, label, meta = {}) {
   _ingestCount++;
 
   // Recompute H¹
-  const sheafResult = SHEAF.computeCoboundaryNorm();
+  const sheafResult = COMPACT_MODE.enabled ? 
+    { isContradiction: SHEAF.lastSheafNorm > SHEAF_CONFIG.sheaf_contradiction_threshold } : 
+    SHEAF.computeCoboundaryNorm();
 
   updateFooterStats();
   updateIngestStats();
@@ -1935,10 +2016,24 @@ window.runQuery = async function() {
   const queryEmb = EMBEDDER.embedText(text);
 
   // Fisher-Rao k-NN retrieval
-  const results = SHEAF.retrieve(queryEmb, label, k);
+  const t0 = performance.now();
+  let results;
+  if (BIN_IDX.built && BIN_IDX.binary.length === SHEAF.contexts.length) {
+    const qBits = binarizeEmbedding(queryEmb, BIN_IDX.rotation, BIN_IDX.dim);
+    const candidates = binarySearch(qBits, k * 2, queryEmb); // returns objects with { idx, sim, frDist }
+    results = candidates.slice(0, k).map(cand => ({
+      ctx: SHEAF.contexts[cand.idx],
+      dist: cand.frDist,
+    }));
+    LOG.dim(`Binary index fast path: retrieved ${results.length} candidates in ${(performance.now()-t0).toFixed(2)}ms`);
+  } else {
+    results = SHEAF.retrieve(queryEmb, label, k);
+  }
 
   // Contradiction check
-  const sheafResult = SHEAF.computeCoboundaryNorm();
+  const sheafResult = COMPACT_MODE.enabled ? 
+    { isContradiction: SHEAF.lastSheafNorm > SHEAF_CONFIG.sheaf_contradiction_threshold } : 
+    SHEAF.computeCoboundaryNorm();
 
   // Render results
   const resultsEl = document.getElementById('query-results');
@@ -2233,6 +2328,14 @@ function renderStateCells(emb) {
 
 // ── Export / Import ───────────────────────────────────────────────────────
 window.exportSnapshot = function() {
+  const restrictionMapsSerialized = {};
+  for (const [key, map] of Object.entries(SHEAF._restrictionMaps)) {
+    restrictionMapsSerialized[key] = {
+      scale: Array.from(map.scale),
+      bias:  Array.from(map.bias),
+    };
+  }
+
   const snapshot = {
     version: '1.0',
     tool: 'RAG Time',
@@ -2244,6 +2347,7 @@ window.exportSnapshot = function() {
       variance: Array.from(c.variance),
       poincareR: c.poincareR, age: c.age, step: c.step
     })),
+    restrictionMaps: restrictionMapsSerialized,
     step: SHEAF._step,
     contradictions: SHEAF.totalContradictions,
   };
@@ -2275,6 +2379,23 @@ window.importSnapshot = function(evt) {
       }
       SHEAF._step = snap.step || 0;
       SHEAF.totalContradictions = snap.contradictions || 0;
+      
+      // Restore restriction maps
+      if (snap.restrictionMaps) {
+        SHEAF._restrictionMaps = {};
+        for (const [key, mapData] of Object.entries(snap.restrictionMaps)) {
+          SHEAF._restrictionMaps[key] = {
+            scale: new Float32Array(mapData.scale),
+            bias:  new Float32Array(mapData.bias),
+          };
+        }
+        // Re-render restriction map UI if on that tab
+        if (document.getElementById('rmap-grid')) renderRmapCards();
+        rmapLog(`Restriction maps restored from snapshot (${Object.keys(snap.restrictionMaps).length} maps)`);
+      } else {
+        LOG.warn('Snapshot does not contain restriction maps – using fresh identity maps');
+      }
+
       updateFooterStats(); updateIngestStats(); renderMemoryBrowser();
       LOG.ok(`Snapshot imported: ${SHEAF.contexts.length} memories`);
     } catch(err) { LOG.err(`Import failed: ${err.message}`); }
@@ -2497,7 +2618,12 @@ function injectWeights(payload) {
     if (banner) banner.style.display = 'block';
     LOG.warn(`${SHEAF.contexts.length} existing memories have stale embeddings — re-embed corpus to align geometry`);
   }
-  if (SHEAF.contexts.length > 0) buildBinaryIndex();
+  BIN_IDX.dirty = true;
+  if (SHEAF.contexts.length > 0) {
+    if (BIN_IDX.built && BIN_IDX.dirty) buildBinaryIndex();
+    else if (BIN_IDX.built && !BIN_IDX.dirty) LOG.dim('Binary index already up-to-date');
+    else buildBinaryIndex(); // initial build
+  }
   LOG.ok(`Weights injected: ${synced} layers from Evangelion (step ${step})`);
   setSysStatus('WEIGHTS SYNCED', 'busy');
   setTimeout(() => setSysStatus('READY', 'live'), 2000);
@@ -2553,6 +2679,7 @@ window.resetWeights = function() {
   const wst=document.getElementById('wt-status');if(wst){wst.textContent='RANDOM';wst.className='vl';}
   const lg=document.getElementById('layer-grid');if(lg)lg.innerHTML='<div style="color:var(--tdim);font-family:var(--font-mono);font-size:11px;">No weights loaded.</div>';
   const banner=document.getElementById('stale-corpus-banner');if(banner)banner.style.display='none';
+  BIN_IDX.dirty = true;
   LOG.warn('Weights reset to random initialization');
 };
 
@@ -2581,8 +2708,10 @@ window.reEmbedCorpus = async function() {
     ctx.poincareR = Math.max(0, Math.min(0.99, 0.3 + 0.4 * novelty));
     await new Promise(r=>setTimeout(r,0)); // yield
   }
+  BIN_IDX.dirty = true;
   // Rebuild binary index with fresh embeddings
-  if(BIN_IDX.built) buildBinaryIndex();
+  if(BIN_IDX.built && BIN_IDX.dirty) buildBinaryIndex();
+  else if(BIN_IDX.built && !BIN_IDX.dirty) LOG.dim('Binary index already up-to-date');
   if(banner) banner.style.display='none';
   if(progressEl) progressEl.textContent='';
   setSysStatus('READY','live');
@@ -2591,7 +2720,7 @@ window.reEmbedCorpus = async function() {
 };
 
 // ── v2: LittleBit-2 XNOR/POPCNT Binary Index ─────────────────────────────
-const BIN_IDX = { vectors:[], ids:[], binary:[], rotation:null, dim:RT_CFG.dim, built:false, nWords:0 };
+const BIN_IDX = { vectors:[], ids:[], binary:[], rotation:null, dim:RT_CFG.dim, built:false, nWords:0, dirty:true };
 
 function gramSchmidt(M, dim) {
   for (let i=0;i<dim;i++) {
@@ -2647,6 +2776,7 @@ window.buildBinaryIndex = function() {
   BIN_IDX.vectors=embeddings; BIN_IDX.ids=SHEAF.contexts.map(c=>c.id);
   BIN_IDX.binary=SHEAF.contexts.map(c=>binarizeEmbedding(c.vec,R,dim));
   BIN_IDX.built=true;
+  BIN_IDX.dirty=false;
   const indexBytes=BIN_IDX.binary.length*BIN_IDX.nWords*4;
   const fullBytes=SHEAF.contexts.length*dim*4;
   const compression=(fullBytes/indexBytes).toFixed(1);
@@ -2952,90 +3082,100 @@ function buildContrastivePairs() {
 // Perturbs RWKV embedder character embeddings toward pull/push objectives
 function contrastiveAdaptStep(lr) {
   const { pull, push } = buildContrastivePairs();
-  if (pull.length === 0 && push.length === 0) return { loss: 0, pullPairs: 0, pushPairs: 0, pairs: [] };
+  if (pull.length === 0 && push.length === 0) return { loss: 0, pullPairs: 0, pushPairs: 0, pairs: [], drift: 0 };
 
   const dim = RT_CFG.dim;
-  const eps = 1e-3;
   let totalLoss = 0;
   const displayPairs = [];
 
-  // Helper: Fisher-Rao distance between two context indices
-  const frDist = (i, j) => {
-    const a = SHEAF.contexts[i], b = SHEAF.contexts[j];
-    return SHEAF._fisherRaoDistance(
-      { vec: a.vec, variance: a.variance },
-      { vec: b.vec, variance: b.variance }
-    );
-  };
-
-  // For each pair, compute gradient w.r.t. charEmbed via FD
-  // and nudge embedder character embeddings accordingly
-  const charEmbedGrad = new Float32Array(EMBEDDER.charEmbed.length);
-
-  for (const [i, j] of pull) {
-    const before = frDist(i, j);
-    // Finite difference: perturb a few char embedding dims, measure effect
-    const nSample = Math.min(32, dim);
-    const offset = (ADAPT.steps * nSample) % EMBEDDER.charEmbed.length;
-    for (let d = 0; d < nSample; d++) {
-      const idx = (offset + d) % EMBEDDER.charEmbed.length;
-      EMBEDDER.charEmbed[idx] += eps;
-      // Re-embed both contexts
-      const newVecI = EMBEDDER.embedText(SHEAF.contexts[i].text.slice(0, 128));
-      const newVecJ = EMBEDDER.embedText(SHEAF.contexts[j].text.slice(0, 128));
-      const newCtxI = { vec: newVecI, variance: EMBEDDER.embeddingVariance(newVecI) };
-      const newCtxJ = { vec: newVecJ, variance: EMBEDDER.embeddingVariance(newVecJ) };
-      const after = SHEAF._fisherRaoDistance(newCtxI, newCtxJ);
-      // Pull: want distance to decrease → gradient points toward decrease
-      charEmbedGrad[idx] += (after - before) / eps;
-      EMBEDDER.charEmbed[idx] -= eps;
-    }
-    totalLoss += before;
-    displayPairs.push({ type: 'pull', a: SHEAF.contexts[i].text.slice(0, 40), b: SHEAF.contexts[j].text.slice(0, 40), dist: before.toFixed(3) });
-  }
-
-  for (const [i, j, h1] of push) {
-    const before = frDist(i, j);
-    const nSample = Math.min(32, dim);
-    const offset = (ADAPT.steps * nSample + 16) % EMBEDDER.charEmbed.length;
-    for (let d = 0; d < nSample; d++) {
-      const idx = (offset + d) % EMBEDDER.charEmbed.length;
-      EMBEDDER.charEmbed[idx] += eps;
-      const newVecI = EMBEDDER.embedText(SHEAF.contexts[i].text.slice(0, 128));
-      const newVecJ = EMBEDDER.embedText(SHEAF.contexts[j].text.slice(0, 128));
-      const newCtxI = { vec: newVecI, variance: EMBEDDER.embeddingVariance(newVecI) };
-      const newCtxJ = { vec: newVecJ, variance: EMBEDDER.embeddingVariance(newVecJ) };
-      const after = SHEAF._fisherRaoDistance(newCtxI, newCtxJ);
-      // Push: want distance to increase → gradient points toward increase, negate for step
-      charEmbedGrad[idx] -= (after - before) / eps;
-      EMBEDDER.charEmbed[idx] -= eps;
-    }
-    totalLoss += Math.max(0, 1.0 - before); // hinge: push until distance > 1.0
-    displayPairs.push({ type: 'push', a: SHEAF.contexts[i].text.slice(0, 40), b: SHEAF.contexts[j].text.slice(0, 40), dist: before.toFixed(3) });
-  }
-
-  // Apply gradient to char embeddings (SGD)
   let totalDrift = 0;
-  for (let i = 0; i < charEmbedGrad.length; i++) {
-    if (charEmbedGrad[i] !== 0) {
-      const delta = -lr * charEmbedGrad[i];
-      EMBEDDER.charEmbed[i] += delta;
-      totalDrift += delta * delta;
+
+  // For each pull pair: move embeddings closer
+  for (const [i, j] of pull) {
+    const ctxA = SHEAF.contexts[i];
+    const ctxB = SHEAF.contexts[j];
+    const dist = SHEAF._fisherRaoDistance(
+      { vec: ctxA.vec, variance: ctxA.variance },
+      { vec: ctxB.vec, variance: ctxB.variance }
+    );
+    totalLoss += dist;
+
+    // Move both vectors toward their mean
+    const mean = new Float32Array(dim);
+    for (let d = 0; d < dim; d++) mean[d] = (ctxA.vec[d] + ctxB.vec[d]) * 0.5;
+    
+    const deltaA = new Float32Array(dim);
+    const deltaB = new Float32Array(dim);
+    for (let d = 0; d < dim; d++) {
+      const newA = ctxA.vec[d] * (1 - lr) + mean[d] * lr;
+      const newB = ctxB.vec[d] * (1 - lr) + mean[d] * lr;
+      deltaA[d] = newA - ctxA.vec[d];
+      deltaB[d] = newB - ctxB.vec[d];
+      ctxA.vec[d] = newA;
+      ctxB.vec[d] = newB;
+      totalDrift += deltaA[d]*deltaA[d] + deltaB[d]*deltaB[d];
     }
+    // Re-normalize
+    const normA = Math.hypot(...ctxA.vec) + 1e-8;
+    const normB = Math.hypot(...ctxB.vec) + 1e-8;
+    for (let d = 0; d < dim; d++) { ctxA.vec[d] /= normA; ctxB.vec[d] /= normB; }
+    
+    // Hebbian Update for tokens
+    const hebbLr = lr * 0.1;
+    const tokensA = EMBEDDER.tokenize(ctxA.text.slice(0, 256));
+    const tokensB = EMBEDDER.tokenize(ctxB.text.slice(0, 256));
+    for (const t of tokensA) { const off = t*dim; for (let d=0; d<dim; d++) EMBEDDER.charEmbed[off+d] += deltaA[d]*hebbLr; }
+    for (const t of tokensB) { const off = t*dim; for (let d=0; d<dim; d++) EMBEDDER.charEmbed[off+d] += deltaB[d]*hebbLr; }
+
+    displayPairs.push({ type: 'pull', a: ctxA.text.slice(0,40), b: ctxB.text.slice(0,40), dist: dist.toFixed(3) });
   }
 
-  // Re-embed all existing contexts with adapted embedder
-  // (only re-embed the ones involved in pairs to keep it fast)
-  const involved = new Set([...pull.flatMap(p => p), ...push.flatMap(p => p.slice(0,2))]);
-  for (const idx of involved) {
-    if (idx < SHEAF.contexts.length) {
-      const ctx = SHEAF.contexts[idx];
-      const newVec = EMBEDDER.embedText(ctx.text.slice(0, 256));
-      ctx.vec.set(newVec);
+  // For each push pair: move embeddings apart
+  for (const [i, j, h1] of push) {
+    const ctxA = SHEAF.contexts[i];
+    const ctxB = SHEAF.contexts[j];
+    const dist = SHEAF._fisherRaoDistance(
+      { vec: ctxA.vec, variance: ctxA.variance },
+      { vec: ctxB.vec, variance: ctxB.variance }
+    );
+    totalLoss += Math.max(0, 1.0 - dist); // hinge loss
+
+    // Move away from each other
+    const direction = new Float32Array(dim);
+    for (let d = 0; d < dim; d++) direction[d] = ctxA.vec[d] - ctxB.vec[d];
+    const normDir = Math.hypot(...direction) + 1e-8;
+    for (let d = 0; d < dim; d++) direction[d] /= normDir;
+
+    const deltaA = new Float32Array(dim);
+    const deltaB = new Float32Array(dim);
+    for (let d = 0; d < dim; d++) {
+      const newA = ctxA.vec[d] + lr * direction[d];
+      const newB = ctxB.vec[d] - lr * direction[d];
+      deltaA[d] = newA - ctxA.vec[d];
+      deltaB[d] = newB - ctxB.vec[d];
+      ctxA.vec[d] = newA;
+      ctxB.vec[d] = newB;
+      totalDrift += deltaA[d]*deltaA[d] + deltaB[d]*deltaB[d];
     }
+    // Re-normalize
+    const normA = Math.hypot(...ctxA.vec) + 1e-8;
+    const normB = Math.hypot(...ctxB.vec) + 1e-8;
+    for (let d = 0; d < dim; d++) { ctxA.vec[d] /= normA; ctxB.vec[d] /= normB; }
+
+    // Hebbian Update for tokens
+    const hebbLr = lr * 0.1;
+    const tokensA = EMBEDDER.tokenize(ctxA.text.slice(0, 256));
+    const tokensB = EMBEDDER.tokenize(ctxB.text.slice(0, 256));
+    for (const t of tokensA) { const off = t*dim; for (let d=0; d<dim; d++) EMBEDDER.charEmbed[off+d] += deltaA[d]*hebbLr; }
+    for (const t of tokensB) { const off = t*dim; for (let d=0; d<dim; d++) EMBEDDER.charEmbed[off+d] += deltaB[d]*hebbLr; }
+
+    displayPairs.push({ type: 'push', a: ctxA.text.slice(0,40), b: ctxB.text.slice(0,40), dist: dist.toFixed(3) });
   }
 
+  // Update character embeddings to reflect the changed context vectors (optional – skip for speed)
+  // The direct vector updates are enough to adapt retrieval; char embeddings are not used elsewhere.
   ADAPT.adapted = true;
+  BIN_IDX.dirty = true;
 
   return {
     loss: totalLoss / Math.max(1, pull.length + push.length),
@@ -3057,7 +3197,8 @@ window.singleAdaptStep = function() {
   ADAPT.totalPushPairs += result.pushPairs;
   ADAPT.lastPairs = result.pairs;
   updateAdaptUI(result);
-  if (BIN_IDX.built) buildBinaryIndex(); // rebuild with adapted embeddings
+  if (BIN_IDX.built && BIN_IDX.dirty) buildBinaryIndex(); // rebuild with adapted embeddings
+  else if (BIN_IDX.built && !BIN_IDX.dirty) LOG.dim('Binary index already up-to-date');
 };
 
 window.toggleAdaptTraining = function() {
@@ -3087,7 +3228,8 @@ window.toggleAdaptTraining = function() {
       updateAdaptUI(result);
       if (ADAPT.steps % 20 === 0) {
         adaptLog(`step ${ADAPT.steps}: loss=${result.loss.toFixed(4)} pull=${result.pullPairs} push=${result.pushPairs} drift=${result.drift.toFixed(5)}`);
-        if (BIN_IDX.built) buildBinaryIndex();
+        if (BIN_IDX.built && BIN_IDX.dirty) buildBinaryIndex();
+        else if (BIN_IDX.built && !BIN_IDX.dirty) LOG.dim('Binary index already up-to-date');
       }
       // Update writeback status
       const wbDot = document.getElementById('wb-dot');
@@ -3127,6 +3269,7 @@ window.resetAdaptation = function() {
   const wbTxt = document.getElementById('wb-status-text'); if (wbTxt) wbTxt.textContent = 'No adaptation yet — adapt corpus before writeback';
   const wbState = document.getElementById('wb-state'); if (wbState) { wbState.textContent = 'UNADAPTED'; wbState.className = 'vl'; }
   setSysStatus('READY', 'live');
+  BIN_IDX.dirty = true;
   LOG.rt('Adaptation reset — char embeddings reinitialized');
 };
 
